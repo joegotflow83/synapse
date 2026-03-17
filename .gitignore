@@ -11,6 +11,7 @@ claude-standard-loop.sh
 *.log
 specs/
 /synapse
+coverage.out
 
 
 @AGENTS.md

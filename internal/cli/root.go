@@ -15,6 +15,8 @@ var rootCmd = &cobra.Command{
 	Long: `Synapse is a persistence layer for multi-agent LLM collaboration.
 It enables autonomous agents to share state via a shared filesystem volume
 with a CLI-first interface for easy integration.`,
+	SilenceErrors: true,
+	SilenceUsage:  true,
 }
 
 func init() {
