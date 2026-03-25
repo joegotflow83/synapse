@@ -487,6 +487,12 @@ func TestErrorCases(t *testing.T) {
 		if code != 2 {
 			t.Fatalf("expected exit 2 for compact on uninitialized dir, got %d", code)
 		}
+
+		// Reindex on uninitialized dir
+		_, _, code = run(t, "--dir", uninitDir, "reindex")
+		if code != 2 {
+			t.Fatalf("expected exit 2 for reindex on uninitialized dir, got %d", code)
+		}
 	})
 
 	t.Run("init lock failure exit code 3", func(t *testing.T) {
@@ -955,6 +961,38 @@ func TestListTypesJSONLFormat(t *testing.T) {
 	}
 }
 
+func TestInsertMaxDataSize(t *testing.T) {
+	dir := t.TempDir()
+	run(t, "--dir", dir, "init")
+
+	// Small data (under 256 bytes) should succeed with --max-data-size 256.
+	smallData := `{"key":"value"}`
+	stdout, stderr, code := run(t, "--dir", dir, "insert", "--type", "task", "--data", smallData, "--max-data-size", "256")
+	if code != 0 {
+		t.Fatalf("expected success for small data with --max-data-size 256, got code %d\nstderr: %s", code, stderr)
+	}
+	if strings.TrimSpace(stdout) == "" {
+		t.Fatal("expected ID printed on success")
+	}
+
+	// Large data (over 256 bytes) should be rejected with exit code 1.
+	largeValue := strings.Repeat("x", 300)
+	largeData := `{"blob":"` + largeValue + `"}`
+	_, stderr, code = run(t, "--dir", dir, "insert", "--type", "task", "--data", largeData, "--max-data-size", "256")
+	if code != 1 {
+		t.Fatalf("expected exit 1 for oversized data with --max-data-size 256, got code %d", code)
+	}
+	if !strings.Contains(stderr, "exceeds --max-data-size") {
+		t.Fatalf("expected 'exceeds --max-data-size' in stderr, got: %s", stderr)
+	}
+
+	// Without --max-data-size the oversized insert should succeed.
+	_, _, code = run(t, "--dir", dir, "insert", "--type", "task", "--data", largeData)
+	if code != 0 {
+		t.Fatalf("expected success without --max-data-size flag, got code %d", code)
+	}
+}
+
 func TestEnvVarDir(t *testing.T) {
 	dir := t.TempDir()
 
@@ -972,5 +1010,383 @@ func TestEnvVarDir(t *testing.T) {
 	// Verify files were created in the env var dir
 	if _, err := os.Stat(filepath.Join(dir, "events.cbor")); err != nil {
 		t.Fatalf("events.cbor not created: %v", err)
+	}
+}
+
+// TestQueryMultiTypeCLI verifies that repeated --type/--filter flags trigger
+// multi-query (batch) mode, returning grouped results indexed by position.
+func TestQueryMultiTypeCLI(t *testing.T) {
+	dir := t.TempDir()
+	run(t, "--dir", dir, "init")
+
+	// Insert entries of two different types.
+	run(t, "--dir", dir, "insert", "--type", "bug", "--data", `{"severity":"critical","title":"crash"}`)
+	run(t, "--dir", dir, "insert", "--type", "bug", "--data", `{"severity":"low","title":"typo"}`)
+	run(t, "--dir", dir, "insert", "--type", "note", "--data", `{"content":"reminder"}`)
+
+	// Query with two --type flags — should return batch results.
+	stdout, stderr, code := run(t, "--dir", dir, "query",
+		"--type", "bug",
+		"--type", "note",
+	)
+	if code != 0 {
+		t.Fatalf("multi-type query failed with code %d: %s", code, stderr)
+	}
+
+	// Output should be a JSON array of indexed results.
+	var results []struct {
+		Index   int              `json:"index"`
+		Entries []map[string]any `json:"entries"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &results); err != nil {
+		t.Fatalf("failed to parse multi-query output: %v\n%s", err, stdout)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 result groups, got %d", len(results))
+	}
+	if results[0].Index != 0 || len(results[0].Entries) != 2 {
+		t.Fatalf("expected group 0 to have 2 bug entries, got %d", len(results[0].Entries))
+	}
+	if results[1].Index != 1 || len(results[1].Entries) != 1 {
+		t.Fatalf("expected group 1 to have 1 note entry, got %d", len(results[1].Entries))
+	}
+}
+
+// TestQueryMultiTypeWithFilter verifies that --type/--filter pairs are applied
+// correctly in multi-query mode.
+func TestQueryMultiTypeWithFilter(t *testing.T) {
+	dir := t.TempDir()
+	run(t, "--dir", dir, "init")
+
+	run(t, "--dir", dir, "insert", "--type", "bug", "--data", `{"severity":"critical"}`)
+	run(t, "--dir", dir, "insert", "--type", "bug", "--data", `{"severity":"low"}`)
+	run(t, "--dir", dir, "insert", "--type", "task", "--data", `{"status":"open"}`)
+	run(t, "--dir", dir, "insert", "--type", "task", "--data", `{"status":"done"}`)
+
+	stdout, stderr, code := run(t, "--dir", dir, "query",
+		"--type", "bug", "--filter", "severity=critical",
+		"--type", "task", "--filter", "status=open",
+	)
+	if code != 0 {
+		t.Fatalf("multi-type+filter query failed with code %d: %s", code, stderr)
+	}
+
+	var results []struct {
+		Index   int              `json:"index"`
+		Entries []map[string]any `json:"entries"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &results); err != nil {
+		t.Fatalf("failed to parse output: %v\n%s", err, stdout)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 groups, got %d", len(results))
+	}
+	if len(results[0].Entries) != 1 {
+		t.Fatalf("expected 1 critical bug, got %d", len(results[0].Entries))
+	}
+	if len(results[1].Entries) != 1 {
+		t.Fatalf("expected 1 open task, got %d", len(results[1].Entries))
+	}
+}
+
+// TestQueryMultiTypeJSONL verifies --format jsonl output in multi-query mode.
+func TestQueryMultiTypeJSONL(t *testing.T) {
+	dir := t.TempDir()
+	run(t, "--dir", dir, "init")
+
+	run(t, "--dir", dir, "insert", "--type", "bug", "--data", `{"title":"b1"}`)
+	run(t, "--dir", dir, "insert", "--type", "note", "--data", `{"title":"n1"}`)
+
+	stdout, stderr, code := run(t, "--dir", dir, "query",
+		"--type", "bug", "--type", "note",
+		"--format", "jsonl",
+	)
+	if code != 0 {
+		t.Fatalf("multi-type jsonl query failed with code %d: %s", code, stderr)
+	}
+
+	lines := strings.Split(strings.TrimSpace(stdout), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 JSONL lines, got %d\n%s", len(lines), stdout)
+	}
+	for i, line := range lines {
+		var row struct {
+			Index   int              `json:"index"`
+			Entries []map[string]any `json:"entries"`
+		}
+		if err := json.Unmarshal([]byte(line), &row); err != nil {
+			t.Fatalf("failed to parse line %d: %v", i, err)
+		}
+		if row.Index != i {
+			t.Fatalf("expected index %d, got %d", i, row.Index)
+		}
+		if len(row.Entries) != 1 {
+			t.Fatalf("expected 1 entry in group %d, got %d", i, len(row.Entries))
+		}
+	}
+}
+
+// TestInsertStdin_Basic verifies that --stdin reads JSONL from stdin, inserts all
+// entries, and prints one ID per line on stdout.
+func TestInsertStdin_Basic(t *testing.T) {
+	dir := t.TempDir()
+	run(t, "--dir", dir, "init")
+
+	jsonl := `{"type":"task","data":{"title":"first"}}
+{"type":"note","data":{"body":"second"}}
+{"type":"task","data":{"title":"third"}}
+`
+	cmd := exec.Command(testBin, "--dir", dir, "insert", "--stdin")
+	cmd.Stdin = strings.NewReader(jsonl)
+	var outBuf, errBuf strings.Builder
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("insert --stdin failed: %v\nstderr: %s", err, errBuf.String())
+	}
+
+	lines := strings.Split(strings.TrimSpace(outBuf.String()), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("expected 3 IDs, got %d: %q", len(lines), outBuf.String())
+	}
+	// Each line should be a non-empty ID.
+	for i, id := range lines {
+		if strings.TrimSpace(id) == "" {
+			t.Fatalf("line %d: empty ID", i)
+		}
+	}
+
+	// Verify all three entries are queryable.
+	stdout, _, code := run(t, "--dir", dir, "query")
+	if code != 0 {
+		t.Fatalf("query failed: %d", code)
+	}
+	var entries []map[string]any
+	if err := json.Unmarshal([]byte(stdout), &entries); err != nil {
+		t.Fatalf("parse query result: %v", err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("expected 3 entries, got %d", len(entries))
+	}
+}
+
+// TestInsertStdin_OptionalFields verifies that --stdin entries can include
+// optional id, agent_id, and metadata fields.
+func TestInsertStdin_OptionalFields(t *testing.T) {
+	dir := t.TempDir()
+	run(t, "--dir", dir, "init")
+
+	jsonl := `{"type":"task","data":{"title":"opt"},"id":"custom-001","agent_id":"agent-Z","metadata":{"confidence":0.9}}
+`
+	cmd := exec.Command(testBin, "--dir", dir, "insert", "--stdin")
+	cmd.Stdin = strings.NewReader(jsonl)
+	var outBuf, errBuf strings.Builder
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("insert --stdin with optional fields failed: %v\nstderr: %s", err, errBuf.String())
+	}
+	if strings.TrimSpace(outBuf.String()) != "custom-001" {
+		t.Fatalf("expected id 'custom-001', got %q", outBuf.String())
+	}
+
+	// Verify agent_id and metadata are stored.
+	stdout, _, code := run(t, "--dir", dir, "get", "--id", "custom-001")
+	if code != 0 {
+		t.Fatalf("get failed: %d", code)
+	}
+	var result []map[string]any
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if result[0]["agent_id"] != "agent-Z" {
+		t.Fatalf("expected agent_id 'agent-Z', got %v", result[0]["agent_id"])
+	}
+	meta, ok := result[0]["agent_metadata"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected agent_metadata map, got %T", result[0]["agent_metadata"])
+	}
+	if meta["confidence"] == nil {
+		t.Fatal("expected confidence field in agent_metadata")
+	}
+}
+
+// TestInsertStdin_EmptyLines verifies that blank lines in JSONL input are skipped.
+func TestInsertStdin_EmptyLines(t *testing.T) {
+	dir := t.TempDir()
+	run(t, "--dir", dir, "init")
+
+	jsonl := `
+{"type":"task","data":{"n":1}}
+
+{"type":"task","data":{"n":2}}
+
+`
+	cmd := exec.Command(testBin, "--dir", dir, "insert", "--stdin")
+	cmd.Stdin = strings.NewReader(jsonl)
+	var outBuf, errBuf strings.Builder
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("insert --stdin with empty lines failed: %v\nstderr: %s", err, errBuf.String())
+	}
+	lines := strings.Split(strings.TrimSpace(outBuf.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 IDs (empty lines skipped), got %d: %q", len(lines), outBuf.String())
+	}
+}
+
+// TestInsertStdin_EmptyInput verifies that --stdin with no entries exits with code 1.
+func TestInsertStdin_EmptyInput(t *testing.T) {
+	dir := t.TempDir()
+	run(t, "--dir", dir, "init")
+
+	cmd := exec.Command(testBin, "--dir", dir, "insert", "--stdin")
+	cmd.Stdin = strings.NewReader("")
+	var errBuf strings.Builder
+	cmd.Stderr = &errBuf
+	err := cmd.Run()
+	if err == nil {
+		t.Fatal("expected exit non-zero for empty stdin")
+	}
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok || exitErr.ExitCode() != 1 {
+		t.Fatalf("expected exit 1 for empty stdin, got: %v", err)
+	}
+	if !strings.Contains(errBuf.String(), "no entries read from stdin") {
+		t.Fatalf("expected 'no entries read from stdin' in stderr, got: %s", errBuf.String())
+	}
+}
+
+// TestInsertStdin_InvalidJSON verifies that malformed JSONL exits with code 1.
+func TestInsertStdin_InvalidJSON(t *testing.T) {
+	dir := t.TempDir()
+	run(t, "--dir", dir, "init")
+
+	cmd := exec.Command(testBin, "--dir", dir, "insert", "--stdin")
+	cmd.Stdin = strings.NewReader("not-valid-json\n")
+	var errBuf strings.Builder
+	cmd.Stderr = &errBuf
+	err := cmd.Run()
+	if err == nil {
+		t.Fatal("expected exit non-zero for invalid JSON")
+	}
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok || exitErr.ExitCode() != 1 {
+		t.Fatalf("expected exit 1 for invalid JSON, got: %v", err)
+	}
+	if !strings.Contains(errBuf.String(), "invalid JSON on stdin") {
+		t.Fatalf("expected 'invalid JSON on stdin' in stderr, got: %s", errBuf.String())
+	}
+}
+
+// TestInsertStdin_MissingType verifies that a JSONL line without "type" exits with code 1.
+func TestInsertStdin_MissingType(t *testing.T) {
+	dir := t.TempDir()
+	run(t, "--dir", dir, "init")
+
+	cmd := exec.Command(testBin, "--dir", dir, "insert", "--stdin")
+	cmd.Stdin = strings.NewReader(`{"data":{"key":"val"}}` + "\n")
+	var errBuf strings.Builder
+	cmd.Stderr = &errBuf
+	err := cmd.Run()
+	if err == nil {
+		t.Fatal("expected exit non-zero for missing type")
+	}
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok || exitErr.ExitCode() != 1 {
+		t.Fatalf("expected exit 1 for missing type, got: %v", err)
+	}
+	if !strings.Contains(errBuf.String(), `missing "type"`) {
+		t.Fatalf("expected 'missing \"type\"' in stderr, got: %s", errBuf.String())
+	}
+}
+
+// TestInsertStdin_ConflictsWithData verifies that --stdin and --data are mutually exclusive.
+func TestInsertStdin_ConflictsWithData(t *testing.T) {
+	dir := t.TempDir()
+	run(t, "--dir", dir, "init")
+
+	_, stderr, code := run(t, "--dir", dir, "insert",
+		"--stdin",
+		"--type", "task",
+		"--data", `{"key":"val"}`,
+	)
+	if code != 1 {
+		t.Fatalf("expected exit 1 for --stdin + --data, got %d", code)
+	}
+	if !strings.Contains(stderr, "mutually exclusive") {
+		t.Fatalf("expected 'mutually exclusive' in stderr, got: %s", stderr)
+	}
+}
+
+// TestReindexCLI verifies the reindex command rebuilds index.cbor from events.cbor.
+// This is an important recovery path: agents may need to reconstruct a lost or
+// stale index without any data loss, and the CLI must surface the entry count so
+// operators can confirm the rebuild covered the full ledger.
+func TestReindexCLI(t *testing.T) {
+	dir := t.TempDir()
+	run(t, "--dir", dir, "init")
+
+	// Insert a few entries so the index is non-trivial.
+	for i := 0; i < 3; i++ {
+		_, _, code := run(t, "--dir", dir, "insert", "--type", "task", "--data", `{"n":1}`)
+		if code != 0 {
+			t.Fatalf("insert %d failed", i)
+		}
+	}
+
+	// Remove index.cbor to simulate a missing/stale index.
+	indexPath := filepath.Join(dir, "index.cbor")
+	if err := os.Remove(indexPath); err != nil && !os.IsNotExist(err) {
+		t.Fatalf("remove index: %v", err)
+	}
+
+	// Reindex should succeed (exit 0) and report the entry count.
+	stdout, stderr, code := run(t, "--dir", dir, "reindex")
+	if code != 0 {
+		t.Fatalf("reindex failed with code %d\nstderr: %s", code, stderr)
+	}
+	if !strings.Contains(stdout, "3") {
+		t.Fatalf("expected '3' in reindex output, got: %s", stdout)
+	}
+	if !strings.Contains(stdout, "Reindex complete") {
+		t.Fatalf("expected 'Reindex complete' in output, got: %s", stdout)
+	}
+
+	// After reindex, get should still resolve entries correctly.
+	stdout, _, code = run(t, "--dir", dir, "query", "--type", "task")
+	if code != 0 {
+		t.Fatalf("query after reindex failed: %d", code)
+	}
+	var results []map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &results); err != nil {
+		t.Fatalf("parse query result: %v\nstdout: %s", err, stdout)
+	}
+	if len(results) != 3 {
+		t.Fatalf("expected 3 entries after reindex, got %d", len(results))
+	}
+}
+
+// TestQueryMultiTypeConflictsWithQueriesFlag verifies that combining
+// --type (multi) with --queries is rejected.
+func TestQueryMultiTypeConflictsWithQueriesFlag(t *testing.T) {
+	dir := t.TempDir()
+	run(t, "--dir", dir, "init")
+
+	queriesFile := filepath.Join(dir, "q.json")
+	if err := os.WriteFile(queriesFile, []byte(`[{"type":"bug"}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, stderr, code := run(t, "--dir", dir, "query",
+		"--queries", queriesFile,
+		"--type", "bug",
+	)
+	if code != 1 {
+		t.Fatalf("expected exit 1 when combining --queries with --type, got %d", code)
+	}
+	if !strings.Contains(stderr, "--queries cannot be combined") {
+		t.Fatalf("expected conflict error, got: %s", stderr)
 	}
 }

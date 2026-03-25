@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+	"github.com/synapse-tool/synapse/internal/daemon"
 	"github.com/synapse-tool/synapse/internal/ledger"
 )
 
@@ -28,6 +29,21 @@ func init() {
 
 func runCreateType(cmd *cobra.Command, args []string) error {
 	typeName := args[0]
+
+	// Try daemon first; fall back to direct file I/O if it is not running.
+	if c := newDaemonClient(dirFlag); c != nil {
+		err := c.CreateType(absDir(dirFlag), daemon.CreateTypeArgs{
+			Name:        typeName,
+			Description: createTypeDescription,
+			Example:     createTypeExample,
+		})
+		if err != nil {
+			exitOnError(err)
+			return err
+		}
+		fmt.Println(typeName)
+		return nil
+	}
 
 	l, err := ledger.Open(dirFlag)
 	if err != nil {

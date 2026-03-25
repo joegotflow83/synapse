@@ -38,6 +38,22 @@ func runListTypes(cmd *cobra.Command, args []string) error {
 		os.Exit(1)
 	}
 
+	// Try daemon first; fall back to direct file I/O if it is not running.
+	if c := newDaemonClient(dirFlag); c != nil {
+		raw, err := c.ListTypes(absDir(dirFlag))
+		if err != nil {
+			exitOnError(err)
+			return err
+		}
+		// The daemon serializes []ledger.TypeInfo which has the same JSON
+		// field names as typeInfoJSON, so we can unmarshal directly.
+		var items []typeInfoJSON
+		if err := json.Unmarshal(raw, &items); err != nil {
+			return fmt.Errorf("decode daemon response: %w", err)
+		}
+		return writeListTypesOutput(items)
+	}
+
 	l, err := ledger.Open(dirFlag)
 	if err != nil {
 		exitOnError(err)
@@ -61,6 +77,10 @@ func runListTypes(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	return writeListTypesOutput(items)
+}
+
+func writeListTypesOutput(items []typeInfoJSON) error {
 	if listTypesFormat == "jsonl" {
 		enc := json.NewEncoder(os.Stdout)
 		for _, item := range items {
@@ -78,6 +98,5 @@ func runListTypes(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("encode types: %w", err)
 		}
 	}
-
 	return nil
 }

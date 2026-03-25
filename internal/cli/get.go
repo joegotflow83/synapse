@@ -37,6 +37,24 @@ func runGet(cmd *cobra.Command, args []string) error {
 		os.Exit(1)
 	}
 
+	// Try daemon first; fall back to direct file I/O if it is not running.
+	if c := newDaemonClient(dirFlag); c != nil {
+		raw, found, err := c.Get(absDir(dirFlag), getID, getHistory)
+		if err != nil {
+			exitOnError(err)
+			return err
+		}
+		if !found {
+			fmt.Fprintf(os.Stderr, "entry not found: %s\n", getID)
+			os.Exit(2)
+		}
+		var results []*model.Entry
+		if err := json.Unmarshal(raw, &results); err != nil {
+			return fmt.Errorf("decode daemon response: %w", err)
+		}
+		return writeGetOutput(results)
+	}
+
 	l, err := ledger.Open(dirFlag)
 	if err != nil {
 		exitOnError(err)
@@ -54,6 +72,10 @@ func runGet(cmd *cobra.Command, args []string) error {
 		os.Exit(2)
 	}
 
+	return writeGetOutput(results)
+}
+
+func writeGetOutput(results []*model.Entry) error {
 	if getFormat == "jsonl" {
 		enc := json.NewEncoder(os.Stdout)
 		for _, entry := range results {
@@ -71,6 +93,5 @@ func runGet(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("encode results: %w", err)
 		}
 	}
-
 	return nil
 }

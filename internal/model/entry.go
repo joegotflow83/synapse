@@ -80,12 +80,19 @@ func parseISOTimestamp(s string) (int64, error) {
 
 // Validate checks required fields, auto-generates ID if empty, and sets
 // Timestamp to now (Unix seconds) if zero. Returns an error if Type is empty.
+// MaxIDLength is the maximum allowed length for entry IDs, constrained by
+// the binary id_index.bin format (64-byte field, zero-padded).
+const MaxIDLength = 63
+
 func (e *Entry) Validate() error {
 	if e.Type == "" {
 		return fmt.Errorf("entry type is required")
 	}
 	if e.ID == "" {
 		e.ID = uuid.New().String()
+	}
+	if len(e.ID) > MaxIDLength {
+		return fmt.Errorf("id too long: %d bytes (max %d)", len(e.ID), MaxIDLength)
 	}
 	if e.Timestamp == 0 {
 		e.Timestamp = time.Now().Unix()
