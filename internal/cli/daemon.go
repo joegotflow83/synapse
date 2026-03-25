@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -96,7 +95,7 @@ func runDaemonStart(cmd *cobra.Command, args []string) error {
 	childArgs := []string{"--dir", absD, "daemon", "_run", "--socket", socketPath}
 	child := exec.Command(self, childArgs...)
 	// Detach from the parent's session so the daemon outlives the parent.
-	child.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	child.SysProcAttr = daemonSysProcAttr()
 	child.Stdout = nil
 	child.Stderr = nil
 	child.Stdin = nil
